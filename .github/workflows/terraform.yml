@@ -1,0 +1,171 @@
+name: terraform-eks
+
+# PR       -> checks + plan (shown in the run summary). Nothing is applied.
+# main     -> checks + plan saved as tfplan -> waits for your approval -> applies that exact plan
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch: {} # "Run workflow" button, for re-running on main
+
+permissions:
+  contents: read
+
+# Never run two Terraform jobs against the same state at once
+concurrency:
+  group: terraform-eks-sandbox
+  cancel-in-progress: false
+
+env:
+  TF_VAR_endpoint_public_access_cidrs: ${{ vars.KUBE_API_CIDRS }} # e.g. ["203.0.113.10/32"]
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_REGION: us-east-2
+  TF_VERSION: "~1.13.0"
+
+defaults:
+  run:
+    working-directory: infra
+
+jobs:
+  # ---------- 1. Static checks: no AWS access needed ----------
+  checks:
+    name: fmt / validate / tflint / checkov
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - uses: terraform-linters/setup-tflint@v4
+
+      - name: tflint --init
+        run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids GitHub API rate limits when downloading the AWS ruleset
+
+      - name: tflint
+        run: tflint --format compact
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra
+          config_file: infra/.checkov.yaml
+          soft_fail: false # a failed check fails the PR
+
+  # ---------- 2. Plan: read-only AWS role ----------
+  plan:
+    name: plan
+    needs: checks
+    # forks never get AWS access (GitHub also withholds secrets from fork PRs)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      changes: ${{ steps.plan.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.PLAN_AWS_ACCESS_KEY_ID }} # read-only user, repo secret
+          aws-secret-access-key: ${{ secrets.PLAN_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform plan
+        id: plan
+        run: |
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes
+          set +e
+          terraform plan -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then exit 1; fi
+          if [ "$code" -eq 2 ]; then echo "changes=true" >> "$GITHUB_OUTPUT"; else echo "changes=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Show plan in the run summary
+        run: |
+          terraform show -no-color tfplan > plan.txt
+          {
+            echo "## Terraform plan"
+            echo '```'
+            grep -E '^(Plan:|No changes)' plan.txt || true
+            echo '```'
+            echo "<details><summary>Full plan</summary>"
+            echo
+            echo '```'
+            head -c 60000 plan.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Only main keeps the plan, so the apply job applies exactly what was reviewed
+      - name: Save plan for apply
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && steps.plan.outputs.changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: |
+            infra/tfplan
+            infra/.terraform.lock.hcl
+          include-hidden-files: true # .terraform.lock.hcl starts with a dot
+          retention-days: 3
+
+  # ---------- 3. Apply: waits for approval on the eks-sandbox environment ----------
+  apply:
+    name: apply (needs approval)
+    needs: plan
+    # only when there's something to change; no approval prompt for "No changes"
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.plan.outputs.changes == 'true'
+    runs-on: ubuntu-latest
+    environment: eks-sandbox # required reviewers = the manual check; also unlocks the APPLY_* secrets
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Download the reviewed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: infra
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.APPLY_AWS_ACCESS_KEY_ID }} # admin user, eks-sandbox ENVIRONMENT secret
+          aws-secret-access-key: ${{ secrets.APPLY_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform apply (saved plan only)
+        run: terraform apply -no-color -lock-timeout=5m tfplan

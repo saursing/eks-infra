@@ -1,0 +1,7 @@
+# Checkov settings for infra/. Every skip needs a reason.
+compact: true
+framework:
+  - terraform
+skip-check:
+  # Registry modules are pinned by version (~> 6.0 / ~> 21.0), not by git commit hash.
+  - CKV_TF_1
