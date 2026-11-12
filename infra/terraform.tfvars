@@ -8,3 +8,6 @@
 admin_principal_arns = [
   "arn:aws:iam::610331149376:role/managed/AccountFullAccessRole",
 ]
+
+# Free plan account: only free-tier-eligible types can launch (t3.medium was refused)
+node_instance_type = "m7i-flex.large" # 2 vCPU, 8 GiB
