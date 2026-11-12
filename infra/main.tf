@@ -60,7 +60,7 @@ module "eks" {
   enabled_log_types = ["api", "audit", "authenticator"]
 
   # Who can use kubectl: the pipeline's apply role (creator) + the people you list
-  enable_cluster_creator_admin_permissions = true
+  enable_cluster_creator_admin_permissions = false
   access_entries = {
     for arn in var.admin_principal_arns : arn => {
       principal_arn = arn
